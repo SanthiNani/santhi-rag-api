@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+requests
+groq
+sqlmodel
+numpy
+openai
+sentence-transformers
+chromadb
