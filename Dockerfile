@@ -5,9 +5,8 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install only minimal system packages
+# Minimal Linux packages (NO git needed)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps

@@ -1,223 +1,299 @@
-# app/main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from typing import Optional, List
+from sqlmodel import select, Session
 from pydantic import BaseModel
-from typing import List
-
+import numpy as np
 import os
 import asyncio
-import numpy as np
 
-from dotenv import load_dotenv
 from groq import Groq
 from fastembed import TextEmbedding
+from pypdf import PdfReader
 
-from app.db import ChatLog, create_db, get_session
+from app.db import (
+    ChatLog,
+    IngestedDocument,
+    IngestedChunk,
+    create_db,
+    get_session,
+)
 
-
-# ---------------------------------------------------------
-# INIT
-# ---------------------------------------------------------
-load_dotenv()
-
-app = FastAPI(title="RAG API (Groq + fastembed)")
-
+# -----------------------------------------
+# FastAPI App Init
+# -----------------------------------------
+app = FastAPI()
 create_db()
 
-# lightweight embedding model (NO torch, NO CUDA)
-embedder = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# -----------------------------------------
+# Embedding model
+# -----------------------------------------
+embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
+# -----------------------------------------
+# Groq LLM Client
+# -----------------------------------------
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# -----------------------------------------
+# Root endpoint
+# -----------------------------------------
+@app.get("/")
+def root():
+    return {"status": "OK", "message": "RAG System Online"}
 
 
-def get_embedding(text: str) -> np.ndarray:
+# ======================================================
+# CHUNKING FUNCTION
+# ======================================================
+
+def chunk_text(
+    text: str,
+    chunk_size: int = 300,
+    overlap: int = 50
+) -> List[str]:
     """
-    Compute a dense vector for input text using fastembed.
-    Returns a numpy array for easy cosine similarity.
+    Simple whitespace-based chunking.
+    - chunk_size = number of words per chunk
+    - overlap = repeated words between chunks (to avoid boundary loss)
     """
-    # embed returns a generator -> first item
-    vec = next(embedder.embed([text]))
-    return np.array(vec, dtype=np.float32)
+    words = text.split()
+    chunks = []
+    start = 0
 
+    while start < len(words):
+        end = start + chunk_size
+        chunk = words[start:end]
+
+        if not chunk:
+            break
+
+        chunks.append(" ".join(chunk))
+
+        start = end - overlap  # sliding window with overlap
+
+    return chunks
+
+
+# ======================================================
+# 1) Normal ASK (ChatLog only)
+# ======================================================
 
 class AskRequest(BaseModel):
     question: str
 
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    # be explicit; otherwise you'll just get 401s and waste time
-    raise RuntimeError("GROQ_API_KEY not set in environment/.env")
-
-client = Groq(api_key=GROQ_API_KEY)
-
-
-# ---------------------------------------------------------
-# ROOT
-# ---------------------------------------------------------
-@app.get("/")
-def root():
-    return {"status": "OK", "message": "LLM API Online (Groq + fastembed)"}
-
-
-# ---------------------------------------------------------
-# 1) NORMAL ASK ENDPOINT
-# ---------------------------------------------------------
 @app.post("/ask")
-def ask(payload: AskRequest):
-    """
-    1) Call Groq LLM with user's question.
-    2) Compute embedding with fastembed.
-    3) Store question, answer, embedding into SQLite.
-    """
-
+def ask(payload: AskRequest, session: Session = Depends(get_session)):
     completion = client.chat.completions.create(
         model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": payload.question}],
+        messages=[{"role": "user", "content": payload.question}]
     )
+
     answer = completion.choices[0].message.content
 
-    # embedding with fastembed (cheap, lightweight)
-    emb = get_embedding(payload.question).tolist()
+    # embed question using fastembed
+    emb = list(embedder.embed([payload.question]))[0]
 
-    with get_session() as session:
-        log = ChatLog(question=payload.question, answer=answer, embedding=emb)
-        session.add(log)
-        session.commit()
+    log = ChatLog(
+        question=payload.question,
+        answer=answer,
+        embedding=emb
+    )
+
+    session.add(log)
+    session.commit()
 
     return {"answer": answer}
 
 
-# ---------------------------------------------------------
-# 2) SEMANTIC SEARCH ENDPOINT
-# ---------------------------------------------------------
-@app.get("/semantic_search")
-def semantic_search(q: str, limit: int = 5):
-    """
-    Semantic search over stored ChatLog questions based on embeddings.
-    """
-    q_emb = get_embedding(q)
+# ======================================================
+# 2) TEXT INGESTION (Chunks + Embeddings)
+# ======================================================
 
-    with get_session() as session:
-        rows: List[ChatLog] = session.query(ChatLog).all()
-
-    scored = []
-    for r in rows:
-        if not r.embedding:
-            continue
-        db_emb = np.array(r.embedding, dtype=np.float32)
-
-        num = float(np.dot(q_emb, db_emb))
-        den = float(np.linalg.norm(q_emb) * np.linalg.norm(db_emb))
-        if den == 0:
-            continue
-        cos = num / den
-        scored.append((cos, r))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    return [
-        {
-            "score": float(s),
-            "question": r.question,
-            "answer": r.answer,
-            "created_at": r.created_at.isoformat(),
-        }
-        for (s, r) in scored[:limit]
-    ]
+class IngestTextRequest(BaseModel):
+    title: str
+    text: str
+    collection: Optional[str] = "default"
 
 
-# ---------------------------------------------------------
-# 3) FULL RAG PIPELINE
-# ---------------------------------------------------------
-@app.get("/rag_answer")
-def rag_answer(q: str, top_k: int = 3):
-    """
-    1) Embed query with fastembed.
-    2) Find top-k similar past Q&A from ChatLog via cosine similarity.
-    3) Build RAG context from retrieved logs.
-    4) Ask Groq LLM using that context.
-    """
-
-    q_emb = get_embedding(q)
-
-    with get_session() as session:
-        rows: List[ChatLog] = session.query(ChatLog).all()
-
-    scored = []
-    for r in rows:
-        if not r.embedding:
-            continue
-        db_emb = np.array(r.embedding, dtype=np.float32)
-
-        num = float(np.dot(q_emb, db_emb))
-        den = float(np.linalg.norm(q_emb) * np.linalg.norm(db_emb))
-        if den == 0:
-            continue
-        cos = num / den
-        scored.append((cos, r))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top_docs = scored[:top_k]
-
-    context = "\n\n".join(
-        [f"Q: {r.question}\nA: {r.answer}" for (_, r) in top_docs]
+@app.post("/ingest_text")
+async def ingest_text(
+    payload: IngestTextRequest,
+    session: Session = Depends(get_session)
+):
+    # Create document row
+    doc = IngestedDocument(
+        title=payload.title,
+        source="text",
+        original_path=None,
+        collection=payload.collection,
     )
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
 
-    prompt = f"""
-You are an AI assistant. Use ONLY the context below to answer the question.
+    # Chunk the text
+    chunks = chunk_text(payload.text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No text extracted.")
 
-Context:
-{context}
+    # Embed chunks
+    embeddings = list(embedder.embed(chunks))
 
-Question:
-{q}
+    # Store chunks
+    for idx, (chunk_text_str, emb) in enumerate(zip(chunks, embeddings)):
+        chunk_row = IngestedChunk(
+            document_id=doc.id,
+            chunk_index=idx,
+            text=chunk_text_str,
+            embedding=list(emb),
+            collection=payload.collection,
+        )
+        session.add(chunk_row)
 
-Answer clearly and concisely based on the context.
-""".strip()
-
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    final_answer = response.choices[0].message.content
+    session.commit()
 
     return {
-        "query": q,
-        "retrieved_docs": [
-            {
-                "score": float(s),
-                "question": r.question,
-                "answer": r.answer,
-            }
-            for (s, r) in top_docs
-        ],
-        "final_answer": final_answer,
+        "status": "ok",
+        "document_id": doc.id,
+        "chunks": len(chunks),
+        "collection": payload.collection,
     }
 
 
-# ---------------------------------------------------------
-# 4) STREAMING ENDPOINT
-# ---------------------------------------------------------
+# ======================================================
+# 3) PDF INGESTION
+# ======================================================
+
+@app.post("/ingest_pdf")
+async def ingest_pdf(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    collection: str = Form("default"),
+    session: Session = Depends(get_session)
+):
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Only PDF allowed.")
+
+    pdf_bytes = await file.read()
+
+    try:
+        reader = PdfReader(os.BytesIO(pdf_bytes))
+        pages = [p.extract_text() or "" for p in reader.pages]
+        text = "\n".join(pages).strip()
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF parsing failed: {e}")
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Failed to extract text.")
+
+    title = title or file.filename
+
+    # Save doc entry
+    doc = IngestedDocument(
+        title=title,
+        source="pdf",
+        original_path=file.filename,
+        collection=collection,
+    )
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+
+    # Chunk
+    chunks = chunk_text(text)
+    embeddings = list(embedder.embed(chunks))
+
+    # Store
+    for idx, (chunk_text_str, emb) in enumerate(zip(chunks, embeddings)):
+        session.add(IngestedChunk(
+            document_id=doc.id,
+            chunk_index=idx,
+            text=chunk_text_str,
+            embedding=list(emb),
+            collection=collection,
+        ))
+
+    session.commit()
+
+    return {
+        "status": "ok",
+        "document_id": doc.id,
+        "chunks": len(chunks)
+    }
+
+
+# ======================================================
+# 4) RAG ANSWER (Retrieval-Augmented Generation)
+# ======================================================
+
+@app.get("/rag_answer")
+def rag_answer(q: str, top_k: int = 5, session: Session = Depends(get_session)):
+
+    q_emb = list(embedder.embed([q]))[0]
+
+    # Fetch chunks
+    rows = session.exec(select(IngestedChunk)).all()
+
+    scored = []
+    for r in rows:
+        emb = np.array(r.embedding)
+        sim = float(np.dot(q_emb, emb) / (np.linalg.norm(q_emb) * np.linalg.norm(emb)))
+        scored.append((sim, r))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    top = scored[:top_k]
+
+    context = "\n\n".join([f"[Chunk {r.chunk_index}] {r.text}" for (_, r) in top])
+
+    prompt = f"""
+Use ONLY the context below to answer the question.
+
+--- CONTEXT ---
+{context}
+
+--- QUESTION ---
+{q}
+
+Answer clearly and concisely based on the context.
+"""
+
+    resp = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    final = resp.choices[0].message.content
+
+    return {
+        "query": q,
+        "retrieved_chunks": [
+            {"score": s, "text": r.text, "chunk_id": r.id}
+            for (s, r) in top
+        ],
+        "final_answer": final
+    }
+
+
+# ======================================================
+# 5) STREAMING ENDPOINT
+# ======================================================
+
 @app.get("/stream")
 async def stream_answer(q: str):
-    """
-    Streams tokens from Groq like ChatGPT.
-    """
-
-    async def token_generator():
+    async def token_stream():
         stream = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": q}],
-            stream=True,
+            stream=True
         )
-
         for chunk in stream:
             delta = chunk.choices[0].delta
             if delta and delta.content:
                 yield delta.content
-                # avoid hammering; also makes Render logs readable
                 await asyncio.sleep(0.01)
-
         yield "\n[END]"
 
-    return StreamingResponse(token_generator(), media_type="text/plain")
+    return StreamingResponse(token_stream(), media_type="text/plain")

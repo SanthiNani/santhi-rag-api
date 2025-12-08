@@ -5,3 +5,5 @@ python-dotenv
 groq
 fastembed
 numpy
+pypdf
+python-multipart
