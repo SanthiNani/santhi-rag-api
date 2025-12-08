@@ -1,11 +1,7 @@
 fastapi
-uvicorn
-pydantic
-requests
-groq
+uvicorn[standard]
 sqlmodel
-numpy
-openai
-sentence-transformers
-chromadb
 python-dotenv
+groq
+fastembed
+numpy

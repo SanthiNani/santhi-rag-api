@@ -1,26 +1,25 @@
-# Use a lightweight Python base image
+# Dockerfile
 FROM python:3.10-slim
 
-# Set working directory
+# Avoid Python writing .pyc files and stdout buffering
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Install system dependencies (required by sentence-transformers)
-RUN apt-get update && apt-get install -y \
-    git \
-    gcc \
+# Install system deps (if needed fastembed uses none heavy)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirement file first (uses Docker cache)
+# Install Python deps
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the entire project
+# Copy app code
 COPY . .
 
-# Expose FastAPI default port
+# Default port (Render will override with $PORT)
 EXPOSE 8000
 
-# Start the FastAPI server
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Use shell form so $PORT works on Render
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
