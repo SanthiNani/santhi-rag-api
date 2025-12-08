@@ -1,9 +1,8 @@
-from datetime import datetime
-from typing import Optional, List
-from sqlmodel import SQLModel, Field, create_engine, Session, JSON
+from sqlmodel import SQLModel, Field, Session, create_engine
+from typing import Optional
+import json
 
 DATABASE_URL = "sqlite:///chatlogs.db"
-
 engine = create_engine(DATABASE_URL, echo=False)
 
 
@@ -11,8 +10,9 @@ class ChatLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     question: str
     answer: str
-    embedding: Optional[List[float]] = Field(sa_column=Field(JSON, nullable=True))
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    embedding: str  # <-- Store as JSON string
+    created_at: Optional[str] = Field(default=None)
+
 
 
 # NEW: Ingested document metadata
