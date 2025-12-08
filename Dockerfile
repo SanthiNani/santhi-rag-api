@@ -1,41 +1,26 @@
-# ----------------------------
-# 1) Base image
-# ----------------------------
+# Use a lightweight Python base image
 FROM python:3.10-slim
 
-# ----------------------------
-# 2) Prevent python from buffering logs
-# ----------------------------
-ENV PYTHONUNBUFFERED=1
-
-# ----------------------------
-# 3) Set working directory
-# ----------------------------
+# Set working directory
 WORKDIR /app
 
-# ----------------------------
-# 4) Install system dependencies
-# ----------------------------
+# Install system dependencies (required by sentence-transformers)
 RUN apt-get update && apt-get install -y \
-    build-essential \
+    git \
+    gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# ----------------------------
-# 5) Copy project files
-# ----------------------------
-COPY . .
+# Copy requirement file first (uses Docker cache)
+COPY requirements.txt .
 
-# ----------------------------
-# 6) Install Python dependencies
-# ----------------------------
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ----------------------------
-# 7) Expose the port FastAPI runs on
-# ----------------------------
+# Copy the entire project
+COPY . .
+
+# Expose FastAPI default port
 EXPOSE 8000
 
-# ----------------------------
-# 8) Run FastAPI using uvicorn
-# ----------------------------
+# Start the FastAPI server
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
