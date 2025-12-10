@@ -61,7 +61,7 @@ if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY not set in environment variables.")
 
 # Default correct model name
-GROQ_MODEL = os.getenv("GROQ_MODEL_NAME", "llama3-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL_NAME", "llama-3.1-8b-instant")
 
 client = Groq(api_key=GROQ_API_KEY)
 
