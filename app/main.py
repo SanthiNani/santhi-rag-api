@@ -43,14 +43,11 @@ app = FastAPI(
 # Basic CORS so frontend (Render / Vercel / localhost) can call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Works for local + Vercel + Render
-    allow_credentials=False,  # Must be False when allow_origins="*"
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],     # REQUIRED for Render
-    max_age=86400             # Helps caching preflight OPTIONS
 )
-
 
 # Create DB tables at startup
 create_db()
@@ -237,6 +234,9 @@ async def ingest_pdf(
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     pdf_bytes = await file.read()
+
+    if len(pdf_bytes) > 5_000_000:# 5 MB
+         raise HTTPException(status_code=413, detail="PDF too large.")
 
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
