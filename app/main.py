@@ -3,7 +3,7 @@
 import os
 import io
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 from fastapi import (
@@ -40,11 +40,11 @@ app = FastAPI(
     description="FastAPI + Groq + FastEmbed RAG backend with chunking & ingestion.",
 )
 
-# Basic CORS so frontend (Render / Vercel / localhost) can call this API
+# CORS: allow everything for now (safe for dev). You can tighten to your frontend origin later.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"],          # e.g. ["http://localhost:5173", "https://your-frontend.com"]
+    allow_credentials=False,      # must be False when using "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -52,16 +52,39 @@ app.add_middleware(
 # Create DB tables at startup
 create_db()
 
-# Embedding model (lightweight, CPU-friendly, free)
+# Embedding model (lightweight, CPU-friendly)
 embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-# Groq client
+# Groq client + model name (override via env if you want)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    # Fail fast at container startup if key is missing
     raise RuntimeError("GROQ_API_KEY environment variable is not set.")
 
+GROQ_MODEL = os.getenv("GROQ_MODEL_NAME", "llama-3.1-8b-instant")
 client = Groq(api_key=GROQ_API_KEY)
+
+
+# ======================================================
+# Helper: Groq call wrapper
+# ======================================================
+
+def call_groq_chat(messages: List[dict]) -> str:
+    """
+    Wrapper around Groq chat completion.
+    Converts all errors to HTTP 500 with clear message.
+    """
+    try:
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        # This avoids ugly stack traces leaking to the client
+        raise HTTPException(
+            status_code=500,
+            detail=f"Groq API error: {str(e)}",
+        )
 
 
 # ======================================================
@@ -114,7 +137,11 @@ class IngestTextRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "OK", "message": "RAG backend online"}
+    return {
+        "status": "OK",
+        "message": "RAG backend online",
+        "model": GROQ_MODEL,
+    }
 
 
 @app.get("/healthz")
@@ -136,13 +163,9 @@ def ask(
     - Sends question to Groq LLM
     - Stores question, answer, and embedding in ChatLog (for future semantic search)
     """
-    completion = client.chat.completions.create(
-        model="llama3-8b-instant",
-        messages=[{"role": "user", "content": payload.question}],
+    answer = call_groq_chat(
+        messages=[{"role": "user", "content": payload.question}]
     )
-
-
-    answer = completion.choices[0].message.content
 
     # Embed question using FastEmbed
     q_vec = list(embedder.embed([payload.question]))[0]
@@ -218,6 +241,9 @@ async def ingest_text(
 # 3) PDF INGESTION
 # ======================================================
 
+MAX_PDF_BYTES = 5_000_000  # 5 MB
+
+
 @app.post("/ingest_pdf")
 async def ingest_pdf(
     file: UploadFile = File(...),
@@ -236,8 +262,11 @@ async def ingest_pdf(
 
     pdf_bytes = await file.read()
 
-    if len(pdf_bytes) > 5_000_000:# 5 MB
-         raise HTTPException(status_code=413, detail="PDF too large.")
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty PDF uploaded.")
+
+    if len(pdf_bytes) > MAX_PDF_BYTES:
+        raise HTTPException(status_code=413, detail="PDF too large (max 5 MB).")
 
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -248,10 +277,6 @@ async def ingest_pdf(
 
     if not full_text:
         raise HTTPException(status_code=400, detail="No text extracted from PDF.")
-
-    if not pdf_bytes:
-        raise HTTPException(status_code=400, detail="Empty PDF uploaded.")
-
 
     title = title or file.filename
 
@@ -329,7 +354,7 @@ def rag_answer(
         )
 
     # 3) Compute cosine similarity
-    scored: List[tuple[float, IngestedChunk]] = []
+    scored: List[Tuple[float, IngestedChunk]] = []
     q_norm = float(np.linalg.norm(q_vec))
     if q_norm == 0.0:
         raise HTTPException(status_code=400, detail="Query embedding norm is zero.")
@@ -370,12 +395,9 @@ Answer clearly and concisely based on the context.
 """
 
     # 5) Call Groq LLM
-    resp = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
+    final_answer = call_groq_chat(
+        messages=[{"role": "user", "content": prompt}]
     )
-
-    final_answer = resp.choices[0].message.content
 
     return {
         "query": q,
@@ -405,19 +427,23 @@ async def stream_answer(q: str):
     """
 
     async def token_stream():
-        stream = client.chat.completions.create(
-            model="llama-3-8b-instant",
-            messages=[{"role": "user", "content": q}],
-            stream=True,
-        )
+        try:
+            stream = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": q}],
+                stream=True,
+            )
 
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                yield delta.content
-                # tiny delay so clients see streaming effect
-                await asyncio.sleep(0.01)
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+                    # tiny delay so clients see streaming effect
+                    await asyncio.sleep(0.01)
 
-        yield "\n[END]"
+            yield "\n[END]"
+        except Exception as e:
+            # On streaming error, send one error line then end
+            yield f"\n[STREAM ERROR: {str(e)}]\n"
 
     return StreamingResponse(token_stream(), media_type="text/plain")
