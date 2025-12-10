@@ -80,12 +80,24 @@ def to_float_list(arr) -> List[float]:
 # ======================================================
 
 def call_groq_chat(messages: List[dict]) -> str:
+    """
+    Wrapper around Groq chat completion.
+    Ensures model errors + empty responses are handled safely.
+    """
     try:
-        res = client.chat.completions.create(
+        completion = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
         )
-        return res.choices[0].message.content
+
+        content = completion.choices[0].message.content
+
+        # 🔥 FIX: Groq sometimes returns None → force safe non-empty answer
+        if not content or not isinstance(content, str) or content.strip() == "":
+            return "(Model returned no answer.)"
+
+        return content.strip()
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -321,7 +333,12 @@ If the answer is not in the context, say "I don't know".
 Question: {q}
 """
 
-    final_answer = call_groq_chat([{"role": "user", "content": prompt}])
+    final_answer = call_groq_chat(
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    if not final_answer or final_answer.strip() == "":
+        final_answer = "(RAG model returned no answer.)"
 
     return {
         "answer": final_answer,
