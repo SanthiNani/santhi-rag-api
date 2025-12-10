@@ -137,9 +137,10 @@ def ask(
     - Stores question, answer, and embedding in ChatLog (for future semantic search)
     """
     completion = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model="llama3-8b-instant",
         messages=[{"role": "user", "content": payload.question}],
     )
+
 
     answer = completion.choices[0].message.content
 
