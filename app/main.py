@@ -43,11 +43,14 @@ app = FastAPI(
 # Basic CORS so frontend (Render / Vercel / localhost) can call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # tighten later if needed
-    allow_credentials=True,
+    allow_origins=["*"],  # Works for local + Vercel + Render
+    allow_credentials=False,  # Must be False when allow_origins="*"
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],     # REQUIRED for Render
+    max_age=86400             # Helps caching preflight OPTIONS
 )
+
 
 # Create DB tables at startup
 create_db()
@@ -244,6 +247,10 @@ async def ingest_pdf(
 
     if not full_text:
         raise HTTPException(status_code=400, detail="No text extracted from PDF.")
+
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty PDF uploaded.")
+
 
     title = title or file.filename
 
